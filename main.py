@@ -5,9 +5,10 @@ import time
 import os
 import websockets
 from loguru import logger
-from dotenv import load_dotenv
+from dotenv import load_dotenv, set_key
 from XianyuApis import XianyuApis
 import sys
+import random
 
 
 from utils.xianyu_utils import generate_mid, generate_uuid, trans_cookies, generate_device_id, decrypt
@@ -52,6 +53,9 @@ class XianyuLive:
         
         # 人工接管关键词，从环境变量读取
         self.toggle_keywords = os.getenv("TOGGLE_KEYWORDS", "。")
+        
+        # 模拟人工输入配置
+        self.simulate_human_typing = os.getenv("SIMULATE_HUMAN_TYPING", "False").lower() == "true"
 
     async def refresh_token(self):
         """刷新token"""
@@ -239,6 +243,22 @@ class XianyuLive:
             )
         except Exception:
             return False
+    
+    def is_bracket_system_message(self, message):
+        """检查是否为带中括号的系统消息"""
+        try:
+            if not message or not isinstance(message, str):
+                return False
+            
+            clean_message = message.strip()
+            # 检查是否以 [ 开头，以 ] 结尾
+            if clean_message.startswith('[') and clean_message.endswith(']'):
+                logger.debug(f"检测到系统消息: {clean_message}")
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"检查系统消息失败: {e}")
+            return False
 
     def check_toggle_keywords(self, message):
         """检查消息是否包含切换关键词"""
@@ -407,6 +427,10 @@ class XianyuLive:
             if self.is_manual_mode(chat_id):
                 logger.info(f"🔴 会话 {chat_id} 处于人工接管模式，跳过自动回复")
                 return
+            # 检查是否为带中括号的系统消息
+            if self.is_bracket_system_message(send_message):
+                logger.info(f"检测到系统消息：'{send_message}'，跳过自动回复")
+                return
             if self.is_system_message(message):
                 logger.debug("系统消息，跳过处理")
                 return
@@ -436,6 +460,11 @@ class XianyuLive:
                 context=context
             )
             
+            # 检查是否需要回复
+            if bot_reply == "-":
+                logger.info(f"[无需回复] 用户 {send_user_name} 的消息被识别为无需回复类型")
+                return
+
             # 检查是否为价格意图，如果是则增加议价次数
             if bot.last_intent == "price":
                 self.context_manager.increment_bargain_count_by_chat(chat_id)
@@ -446,6 +475,19 @@ class XianyuLive:
             self.context_manager.add_message_by_chat(chat_id, self.myid, item_id, "assistant", bot_reply)
             
             logger.info(f"机器人回复: {bot_reply}")
+            
+            # 模拟人工输入延迟
+            if self.simulate_human_typing:
+                # 基础延迟 0-1秒 + 每字 0.1-0.3秒
+                base_delay = random.uniform(0, 1)
+                typing_delay = len(bot_reply) * random.uniform(0.1, 0.3)
+                total_delay = base_delay + typing_delay
+                # 设置最大延迟上限，防止过长回复等待太久
+                total_delay = min(total_delay, 10.0)
+                
+                logger.info(f"模拟人工输入，延迟发送 {total_delay:.2f} 秒...")
+                await asyncio.sleep(total_delay)
+                
             await self.send_msg(websocket, chat_id, send_user_id, bot_reply)
             
         except Exception as e:
@@ -606,9 +648,58 @@ class XianyuLive:
                     await asyncio.sleep(5)
 
 
+
+def check_and_complete_env():
+    """检查并补全关键环境变量"""
+    # 定义关键变量及其默认无效值（占位符）
+    critical_vars = {
+        "API_KEY": "默认使用通义千问,apikey通过百炼模型平台获取",
+        "COOKIES_STR": "your_cookies_here"
+    }
+    
+    env_path = ".env"
+    updated = False
+    
+    for key, placeholder in critical_vars.items():
+        curr_val = os.getenv(key)
+        
+        # 如果变量未设置，或者值等于占位符
+        if not curr_val or curr_val == placeholder:
+            logger.warning(f"配置项 [{key}] 未设置或为默认值，请输入")
+            while True:
+                val = input(f"请输入 {key}: ").strip()
+                if val:
+                    # 更新当前环境
+                    os.environ[key] = val
+                    
+                    # 尝试持久化到 .env
+                    try:
+                        # 如果没有.env文件，先创建
+                        if not os.path.exists(env_path):
+                            with open(env_path, 'w', encoding='utf-8') as f:
+                                pass # Create empty file
+                        
+                        set_key(env_path, key, val)
+                        updated = True
+                    except Exception as e:
+                        logger.warning(f"无法自动写入.env文件，请手动保存: {e}")
+                    break
+                else:
+                    print(f"{key} 不能为空，请重新输入")
+    
+    if updated:
+        logger.info("新的配置已保存/更新至 .env 文件中")
+
+
 if __name__ == '__main__':
     # 加载环境变量
-    load_dotenv()
+    if os.path.exists(".env"):
+        load_dotenv()
+        logger.info("已加载 .env 配置")
+    
+    if os.path.exists(".env.example"):
+        load_dotenv(".env.example")  # 不会覆盖已存在的变量
+        logger.info("已加载 .env.example 默认配置")
     
     # 配置日志级别
     log_level = os.getenv("LOG_LEVEL", "DEBUG").upper()
@@ -619,6 +710,9 @@ if __name__ == '__main__':
         format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>"
     )
     logger.info(f"日志级别设置为: {log_level}")
+    
+    # 交互式检查并补全配置
+    check_and_complete_env()
     
     cookies_str = os.getenv("COOKIES_STR")
     bot = XianyuReplyBot()
